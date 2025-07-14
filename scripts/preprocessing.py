@@ -3,6 +3,7 @@ from statsmodels.tsa.stattools import adfuller
 
 def load_data(filepath):
     df = pd.read_excel(filepath, parse_dates=['rok_miesiac'])
+    df['rok_miesiac'] = pd.to_datetime(df['rok_miesiac'], format='%Y%m')
     df.set_index('rok_miesiac', inplace=True)
     return df
 
