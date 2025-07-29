@@ -3,48 +3,34 @@ import pandas as pd
 import optuna
 from sklearn.metrics import mean_squared_error
 from sklearn.model_selection import GridSearchCV, TimeSeriesSplit
-from sklearn.preprocessing import StandardScaler
 from xgboost import XGBRegressor
+import lightgbm as lgb
+from lightgbm import early_stopping
 
-def prepare_ml_data(df, target_col, lag_range):
+def prepare_ml_data(df, target_col):
     df_ml = df.copy()
+    df_ml['target_diff'] = df_ml[target_col].diff()
 
-    # Tworzenie różnicowań, jeśli nie istnieją
-    if 'stopa_bezrobocia_diff' not in df_ml.columns:
-        df_ml['stopa_bezrobocia_diff'] = df_ml['stopa_bezrobocia'].diff()
-    if 'stopa_bezrobocia_diff2' not in df_ml.columns:
-        df_ml['stopa_bezrobocia_diff2'] = df_ml['stopa_bezrobocia_diff'].diff()
+    orig_cols = [col for col in df.columns if col != target_col]
 
-    # 2. Zapisz listę kolumn do lagowania (po dodaniu diffów)
-    orig_cols = df_ml.columns.tolist()
+    for lag in [1, 2, 3, 6, 12]:
+        for col in orig_cols:
+            df_ml[f'{col}_lag_{lag}'] = df_ml[col].shift(lag)
 
-    # 3. Laguj każdą z tych kolumn dla lag = 1…lag_range
-    for col in orig_cols:
-        df_ml[f'{col}_lag{lag_range}'] = df_ml[col].shift(lag_range)
-
-    # Sezonowe cechy czasowe
     df_ml['month_sin'] = np.sin(2 * np.pi * df_ml.index.month / 12)
     df_ml['month_cos'] = np.cos(2 * np.pi * df_ml.index.month / 12)
     df_ml['quarter_sin'] = np.sin(2 * np.pi * df_ml.index.quarter / 4)
     df_ml['quarter_cos'] = np.cos(2 * np.pi * df_ml.index.quarter / 4)
     df_ml['year'] = df_ml.index.year
 
-    # Usuń NA z powodu lagów i diffów
     df_ml.dropna(inplace=True)
 
-    # Budujemy X tylko z:
-    # • wszystkich oryginalnych zmiennych (bez target_col i pierwszej różnicy)
-    # • oraz lagów target_col
-    drop_cols = [target_col, 'stopa_bezrobocia', 'stopa_bezrobocia_diff']
+    drop_cols = [target_col, 'target_diff']
     X = df_ml.drop(columns=drop_cols, errors='ignore')
-    y = df_ml[target_col]
-    return X, y
+    y = df_ml['target_diff']
+    # y = df_ml[target_col]
 
-def scale_data(X_train, X_test):
-    scaler = StandardScaler()
-    X_train_scaled = scaler.fit_transform(X_train)
-    X_test_scaled = scaler.transform(X_test)
-    return X_train_scaled, X_test_scaled, scaler
+    return X, y
 
 def train_xgb_model(X_train, y_train, n_trials=50, use_optuna=False, params=None):
     if not use_optuna:
@@ -117,3 +103,56 @@ def tune_xgb_model(X_train, y_train, param_grid, cv_splits=5):
     )
     grid_search.fit(X_train, y_train)
     return grid_search.best_estimator_, grid_search.best_params_
+
+def train_lgbm_model(X_train, y_train, params=None, random_state=42):
+    params = params or {}
+    params.setdefault('random_state', random_state)
+    model = lgb.LGBMRegressor(**params)
+    model.fit(X_train, y_train)
+    return model
+
+def optimize_lgbm(X_tr, y_tr, n_trials=50, random_state=42):
+    import optuna
+    from sklearn.model_selection import TimeSeriesSplit
+    import lightgbm as lgb
+    from sklearn.metrics import mean_squared_error
+    import numpy as np
+
+    def objective(trial):
+        param_grid = {
+            'n_estimators': trial.suggest_int('n_estimators', 50, 500),
+            'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.3),
+            'num_leaves': trial.suggest_int('num_leaves', 15, 255),
+            'max_depth': trial.suggest_int('max_depth', 3, 15),
+            'min_child_samples': trial.suggest_int('min_child_samples', 1, 100),
+            'min_gain_to_split': trial.suggest_float('min_gain_to_split', -0.1, 0.1),
+            'verbosity': -1
+        }
+        
+        tscv = TimeSeriesSplit(n_splits=5)
+        rmse_scores = []
+
+        for train_idx, val_idx in tscv.split(X_tr):
+            X_train, X_val = X_tr[train_idx], X_tr[val_idx]
+            y_train, y_val = y_tr[train_idx], y_tr[val_idx]
+
+            model = lgb.LGBMRegressor(**param_grid, random_state=random_state)
+            model.fit(
+                X_train, y_train,
+                eval_set=[(X_val, y_val)],
+                callbacks=[
+                    lgb.early_stopping(50),
+                    lgb.log_evaluation(period=0)
+                ]
+            )
+
+
+            preds = model.predict(X_val)
+            rmse_scores.append(np.sqrt(mean_squared_error(y_val, preds)))
+
+        return np.mean(rmse_scores)
+
+    study = optuna.create_study(direction='minimize')
+    study.optimize(objective, n_trials=n_trials)
+
+    return study.best_params
